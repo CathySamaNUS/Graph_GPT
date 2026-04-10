@@ -1,0 +1,24 @@
+/etc/profile.d/modules.sh: line 16: module: command not found
+/etc/profile.d/modules.sh: line 18: module: command not found
+/etc/profile.d/modules.sh: line 20: module: command not found
+/etc/profile.d/modules.sh: line 16: module: command not found
+/etc/profile.d/modules.sh: line 18: module: command not found
+/etc/profile.d/modules.sh: line 20: module: command not found
+Starting Jupyter server on port: 36005
+Running on node: volta06
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+			Resource Usage on 2026-03-26 10:54:47.307771:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	JobId: 14125.cbis-pbs
+	Project: _pbs_project_default
+	Exit Status: 143
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	NCPUs: Requested(10), Used(10)
+	CPU Time Used: 00:00:02
+	Memory: Requested(32gb), Used(95672kb)
+	Vmem Used: 221412kb
+	Walltime: Requested(23:59:00), Used(10:47:25)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	Execution Nodes Used: (volta06:ncpus=10:ngpus=1:mem=33554432kb)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	No GPU-related information available for this job.

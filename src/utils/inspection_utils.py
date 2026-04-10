@@ -1,0 +1,166 @@
+import os
+import numpy as np
+from typing import Dict, Union
+from pprint import pformat
+from functools import partial
+import torch
+from torch_geometric.data import Data
+from torch.utils.data import IterableDataset, Dataset
+
+pformat = partial(pformat, compact=False, width=400)
+
+
+def print_trainable_parameters(model):
+    """
+    copied from `peft/peft_model.py`
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        num_params = param.numel()
+        # if using DS Zero 3 and the weights are initialized empty
+        if num_params == 0 and hasattr(param, "ds_numel"):
+            num_params = param.ds_numel
+
+        all_param += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+    return trainable_params
+
+
+def inspect_nodes(dataset):
+    ls_nodes_cnt = []
+    for paths, _ in dataset:
+        path = paths[0]
+        cnt_nodes = max([tgt for src, tgt, scope in path])
+        ls_nodes_cnt.append(cnt_nodes)
+    cnt_max = max(ls_nodes_cnt)
+    cnt_95 = np.percentile(ls_nodes_cnt, 95)
+    cnt_90 = np.percentile(ls_nodes_cnt, 90)
+    cnt_50 = np.percentile(ls_nodes_cnt, 50)
+    cnt_min = min(ls_nodes_cnt)
+    cnt_mean = np.mean(ls_nodes_cnt)
+    print(
+        f"max nodes cnt: {cnt_max}, 95 percentile cnt: {cnt_95}, 90 percentile cnt: {cnt_90}, median cnt: {cnt_50}, min cnt: {cnt_min}, mean cnt: {cnt_mean}"
+    )
+    return cnt_max
+
+
+def inspect_sequences(dataset):
+    ls_max_len = []
+    for paths, _ in dataset:
+        max_len = max([len(path) for path in paths])
+        ls_max_len.append(max_len)
+    len_max = max(ls_max_len)
+    len_99 = np.percentile(ls_max_len, 99)
+    len_98 = np.percentile(ls_max_len, 98)
+    len_97 = np.percentile(ls_max_len, 97)
+    len_96 = np.percentile(ls_max_len, 96)
+    len_95 = np.percentile(ls_max_len, 95)
+    len_90 = np.percentile(ls_max_len, 90)
+    len_50 = np.percentile(ls_max_len, 50)
+    len_min = min(ls_max_len)
+    len_mean = np.mean(ls_max_len)
+    print(
+        f"max path len: {len_max}, 99/98/97/96/95 percentile len: {len_99}/{len_98}/{len_97}/{len_96}/{len_95}, 90 percentile len: {len_90}, median len: {len_50}, min len: {len_min}, mean len: {len_mean}"
+    )
+
+
+def inspect_tokenization_results(
+    dataset: Union[Dataset, IterableDataset], gtokenizer, idx: int = None
+):
+    if isinstance(dataset, IterableDataset):
+        data = next(iter(dataset))
+        if isinstance(data, tuple):
+            _, data = data
+        # return
+    else:
+        idx = 0 if idx is None else idx
+        idx = dataset.sampler[idx] if hasattr(dataset, "sampler") else idx
+        print(f"\nInspecting graph of index {idx}")
+        idx2, data = dataset[idx]
+        if idx != idx2:
+            print(f"[Warning]Local idx {idx2} NOT equal Global idx {idx}")
+    ls_embed = []
+    if isinstance(data, Data):
+        graph = data
+        print(f"Inspecting tokenization results!\nTokenize graph:\n{data}")
+        token_res = gtokenizer.tokenize(graph)
+        print(
+            f"\nTokens:\n{pformat(token_res.ls_tokens)}\nLabels:\n{pformat(token_res.ls_labels)}\n"
+            f"embed:{torch.tensor(token_res.ls_embed) if token_res.ls_embed is not None else None}\n"
+            f"embed==0:{torch.tensor(token_res.ls_embed)==0 if token_res.ls_embed is not None else None}\n"
+        )
+        tokens, labels, ls_embed, ls_len = (
+            gtokenizer.pack_token_seq(token_res, idx)
+            if gtokenizer.mpe is not None
+            else (
+                token_res.ls_tokens,
+                token_res.ls_labels,
+                token_res.ls_embed,
+                [len(token_res.ls_tokens)],
+            )
+        )
+        print(
+            f"Packed Tokens:\n{pformat(tokens)}\nPacked Labels:\n{pformat(labels)}\n"
+            f"Packed embed:\n{torch.tensor(ls_embed).shape if ls_embed is not None else None}\n"
+            f"{torch.tensor(ls_embed) if ls_embed is not None else None}\n"
+            f"embed==0:{torch.tensor(ls_embed)==0 if ls_embed is not None else None}\n"
+            f"Packed len:\n{pformat(ls_len)}"
+        ) if gtokenizer.mpe is not None else None
+        in_dict = gtokenizer.convert_tokens_to_ids(tokens, labels)
+        if ls_embed:  # for pretty print purpose ONLY
+            in_dict["embed"] = torch.tensor(ls_embed)
+        print(
+            f"Tokenized results:\n{pformat({k: torch.tensor(v) if k in ('attention_mask', 'position_ids') else v for k,v in in_dict.items()})}\n"
+        )
+        if ls_embed:
+            in_dict["embed"] = ls_embed
+        token_res.ls_tokens = tokens
+        token_res.ls_labels = labels
+        token_res.ls_embed = ls_embed
+        token_res.ls_len = ls_len
+        inputs = gtokenizer.prepare_inputs_for_task(
+            in_dict,
+            graph,
+            token_res=token_res,
+        )
+    elif isinstance(data, Dict):
+        inputs = data
+    else:
+        raise ValueError(f"Type {type(data)} of data {data} is NOT implemented yet!")
+    if ls_embed:  # for pretty print purpose ONLY
+        inputs["embed"] = torch.tensor(ls_embed)
+    print(
+        f"Inputs for model:\n{pformat({k: torch.tensor(v) if k in ('attention_mask', 'position_ids') else v for k,v in inputs.items()})}\n"
+        f"Inputs for model -> shape:\n{pformat({'shape-'+k: torch.tensor(v).shape for k,v in inputs.items() if k in ('attention_mask', 'position_ids')})}"
+    )
+    gtokenizer.set_eos_idx(inputs["input_ids"])
+
+
+def inspect_attr(attr, attr_name):
+    dict_names = {
+        "atom": [
+            "possible_atomic_num_list",
+            "possible_chirality_list",
+            "possible_degree_list",
+            "possible_formal_charge_list",
+            "possible_numH_list",
+            "possible_number_radical_e_list",
+            "possible_hybridization_list",
+            "possible_is_aromatic_list",
+            "possible_is_in_ring_list",
+        ],
+        "bond": ["0", "1", "2"],
+    }
+    if attr_name in dict_names.keys():
+        attr_name = dict_names[attr_name]
+    assert attr.shape[1] == len(attr_name)
+    for i in range(attr.shape[1]):
+        unique_values, counts = torch.unique(attr[:, i], return_counts=True)
+        for val, cnt in zip(unique_values, counts):
+            print(f"{attr_name[i]} {i}:{val} => cnt: {cnt}")
