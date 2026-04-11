@@ -26,14 +26,26 @@ try:
     from ogb.graphproppred import PygGraphPropPredDataset
 except ImportError:
     from ogb.graphproppred.dataset_pyg import PygGraphPropPredDataset
-from ogb.lsc import PygPCQM4Mv2Dataset
-from ogb.utils import smiles2graph
+try:
+    from ogb.lsc import PygPCQM4Mv2Dataset
+except ImportError:
+    class PygPCQM4Mv2Dataset:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "PygPCQM4Mv2Dataset is unavailable in this OGB installation."
+            )
+try:
+    from ogb.utils import smiles2graph
+except ImportError:
+    def smiles2graph(*args, **kwargs):
+        raise ImportError("smiles2graph is unavailable in this OGB installation.")
 from src.utils import control_flow, dataset_utils, mol_utils
 from ..conf import DataConfig, TrainingConfig
 from .dataset_map import (
     EnsembleNodesEdgesMapDataset,
     ShaDowKHopSeqMapDataset,
     ShaDowKHopSeqFromEdgesMapDataset,
+    CachedShaDowKHopSeqFromEdgesMapDataset,
     RandomNodesMapDataset,
     GraphsMapDataset,
     EnsembleGraphsMapDataset,
@@ -204,6 +216,46 @@ def _read_local_ogbl_ppa_like_dataset(
     graph.x_gid = _get_global_local_id_from_onehot(graph.x, global_id_only=True)
     graph.x = _get_global_local_id_from_onehot(graph.x, global_id_only=False)
     graph = _attach_ogbl_ppa_external_node_embeddings(graph, data_dir, dataset_root)
+
+    # Check for cached subgraphs
+    use_cache = getattr(data_cfg, "use_cached_subgraphs", False)
+    cache_dir = getattr(data_cfg, "cached_subgraphs_dir", None)
+    if cache_dir is None:
+        cache_dir = os.path.join(dataset_root, "cached_subgraphs")
+
+    if use_cache and os.path.isdir(cache_dir):
+        print(
+            f"\nLoading CACHED subgraphs from {cache_dir}"
+        )
+        neg_ratio = sampling_config["edge_ego"]["neg_ratio"]
+        if return_valid_test:
+            train_dataset = CachedShaDowKHopSeqFromEdgesMapDataset(
+                cache_dir, "train",
+                graph=graph, sampling_config=sampling_config,
+                split_edge=split_edge, neg_ratio=neg_ratio,
+            )
+            valid_dataset = CachedShaDowKHopSeqFromEdgesMapDataset(
+                cache_dir, "valid",
+                graph=graph, sampling_config=sampling_config,
+                split_edge=split_edge, neg_ratio=neg_ratio,
+            )
+            test_dataset = CachedShaDowKHopSeqFromEdgesMapDataset(
+                cache_dir, "test",
+                graph=graph, sampling_config=sampling_config,
+                split_edge=split_edge, neg_ratio=neg_ratio,
+            )
+            print(
+                f"Split dataset based on cached data!\n"
+                f"Train: {len(train_dataset)}, Valid: {len(valid_dataset)}, Test: {len(test_dataset)}!"
+            )
+            return train_dataset, valid_dataset, test_dataset, [graph]
+        dataset = CachedShaDowKHopSeqFromEdgesMapDataset(
+            cache_dir, "train",
+            graph=graph, sampling_config=sampling_config,
+            split_edge=split_edge, neg_ratio=neg_ratio,
+        )
+        return dataset, [graph]
+
     print(
         f"\nLoading dataset from {graph} with ShaDowKHopSeqFromEdgesMapDataset.\nParams:\nsampling_config: {pformat(sampling_config)}"
     )

@@ -27,6 +27,10 @@ class DataConfig:
 
     return_valid_test: bool = False
 
+    # Subgraph cache settings (see scripts/precompute_subgraphs.py)
+    use_cached_subgraphs: bool = False
+    cached_subgraphs_dir: Optional[str] = None  # auto-derived if None
+
     odps: OdpsConfig = field(default_factory=OdpsConfig)
 
 

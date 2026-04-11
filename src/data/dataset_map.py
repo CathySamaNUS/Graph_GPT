@@ -1,4 +1,5 @@
 # refer to: https://pytorch.org/docs/stable/data.html#torch.utils.data.Dataset
+import os
 from datetime import datetime
 import copy
 import random
@@ -798,6 +799,226 @@ def _get_row_equal_mask(a, b):
         len(a.shape) == len(b.shape) == 2
     ), f"a -> {len(a.shape)}, b -> {len(b.shape)}"
     return ~torch.abs(a - b).sum(dim=-1).to(bool)
+
+
+class CachedShaDowKHopSeqFromEdgesMapDataset(torch.utils.data.Dataset):
+    """Drop-in replacement for ShaDowKHopSeqFromEdgesMapDataset that loads
+    pre-computed subgraphs from disk instead of computing them on-the-fly.
+
+    Pre-compute subgraphs with: ``python scripts/precompute_subgraphs.py``
+
+    The class exposes the same interface (``reset_samples``, ``sampler``,
+    ``reset_samples_per_epoch``, ``all_edges_with_y``) so it can be used
+    interchangeably with the original dataset.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str,
+        data_split: str = "train",
+        *,
+        graph: Optional[Data] = None,
+        sampling_config: Optional[Dict] = None,
+        split_edge: Optional[Dict] = None,
+        neg_ratio: int = 1,
+        chunk_size: int = 10000,
+        **kwargs,
+    ):
+        import glob as _glob
+        import json as _json
+
+        self.cache_dir = cache_dir
+        self.data_split = data_split
+        self.neg_ratio = neg_ratio
+        self.chunk_size = chunk_size
+        self.reset_samples_per_epoch = True
+
+        split_dir = os.path.join(cache_dir, data_split)
+        meta_path = os.path.join(cache_dir, "metadata.json")
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(
+                f"Cache directory not found: {split_dir}. "
+                f"Run `python scripts/precompute_subgraphs.py` first."
+            )
+
+        # Load metadata
+        with open(meta_path) as f:
+            self.metadata = _json.load(f)
+
+        # Discover chunk files
+        self._pos_chunks = sorted(
+            _glob.glob(os.path.join(split_dir, "pos_chunk_*.pt"))
+        )
+        self._neg_chunk_pattern = os.path.join(split_dir, "neg_epoch_{:02d}_chunk_*.pt")
+        self._neg_fixed_chunks = sorted(
+            _glob.glob(os.path.join(split_dir, "neg_chunk_*.pt"))
+        )
+        self._neg_epochs_available = self.metadata.get("neg_epochs_computed", 0)
+
+        # Count positive samples
+        self._pos_count = 0
+        for cf in self._pos_chunks:
+            chunk = torch.load(cf, map_location="cpu", weights_only=False)
+            self._pos_count += len(chunk)
+            del chunk
+
+        # Preload all positive subgraphs into memory for fast access
+        print(f"[{datetime.now()}] Loading {self._pos_count} cached positive subgraphs for {data_split} ...")
+        self._pos_data = []
+        for cf in tqdm(self._pos_chunks, desc=f"Loading {data_split}/pos"):
+            chunk = torch.load(cf, map_location="cpu", weights_only=False)
+            self._pos_data.extend(chunk)
+            del chunk
+
+        # For on-the-fly negative fallback
+        self._graph = graph
+        self._adj_t = None
+        self._sampling_config = sampling_config
+        self._split_edge = split_edge
+        if graph is not None:
+            from torch_geometric.utils import add_self_loops as _add_sl
+            self._adj_t = build_adj_t(graph) if not hasattr(graph, "_adj_t_cache") else graph._adj_t_cache
+            self._new_edge_index, _ = _add_sl(graph.edge_index)
+
+        # Initialize samples
+        self._neg_data = []
+        self.all_edges_with_y = None
+        self.sampler = None
+        self.reset_samples()
+
+    def _load_neg_epoch(self, epoch: int):
+        """Load pre-computed negative subgraphs for a given epoch."""
+        import glob as _glob
+        pattern = self._neg_chunk_pattern.format(epoch)
+        chunks = sorted(_glob.glob(pattern))
+        if not chunks:
+            return None
+        neg_data = []
+        for cf in chunks:
+            chunk = torch.load(cf, map_location="cpu", weights_only=False)
+            neg_data.extend(chunk)
+            del chunk
+        return neg_data
+
+    def _load_neg_fixed(self):
+        """Load fixed negative subgraphs (for valid/test)."""
+        if not self._neg_fixed_chunks:
+            return None
+        neg_data = []
+        for cf in self._neg_fixed_chunks:
+            chunk = torch.load(cf, map_location="cpu", weights_only=False)
+            neg_data.extend(chunk)
+            del chunk
+        return neg_data
+
+    def reset_samples(self, epoch: Optional[int] = 0, seed: Optional[int] = 42):
+        print(
+            f"[{datetime.now()}][data: {self.data_split}] RESET cached samples for epoch {epoch}!"
+        )
+
+        if self.data_split == "train" and self._neg_epochs_available > 0:
+            # Use pre-computed negatives, cycling through available epochs
+            neg_epoch = epoch % self._neg_epochs_available
+            print(f"  Loading pre-computed negatives for epoch {neg_epoch} ...")
+            self._neg_data = self._load_neg_epoch(neg_epoch)
+            if self._neg_data is None:
+                print(f"  WARNING: No cached negatives for epoch {neg_epoch}, falling back to on-the-fly")
+                self._neg_data = self._compute_neg_on_the_fly(epoch, seed)
+        elif self.data_split in ("valid", "test"):
+            if not self._neg_data:  # Only load once for valid/test
+                self._neg_data = self._load_neg_fixed()
+                if self._neg_data is None:
+                    self._neg_data = self._compute_neg_on_the_fly(epoch, seed)
+        else:
+            self._neg_data = self._compute_neg_on_the_fly(epoch, seed)
+
+        total = len(self._pos_data) + len(self._neg_data)
+
+        # Build all_edges_with_y for compatibility
+        pos_ey = torch.stack(
+            [torch.tensor([d.seed_node[0].item(), d.seed_node[1].item(), d.y.item()]) for d in self._pos_data]
+        )
+        neg_ey = torch.stack(
+            [torch.tensor([d.seed_node[0].item(), d.seed_node[1].item(), d.y.item()]) for d in self._neg_data]
+        )
+        self.all_edges_with_y = torch.cat([pos_ey, neg_ey], dim=0)
+
+        # Re-index all data
+        for i, d in enumerate(self._pos_data):
+            d.idx = i
+        for i, d in enumerate(self._neg_data):
+            d.idx = len(self._pos_data) + i
+
+        self.sampler = list(range(total))
+        random.shuffle(self.sampler)
+        print(
+            f"[{datetime.now()}] FINISH reset cached dataset: "
+            f"{len(self._pos_data)} pos + {len(self._neg_data)} neg = {total} total\n"
+        )
+
+    def _compute_neg_on_the_fly(self, epoch, seed):
+        """Fallback: compute negative subgraphs on-the-fly (slow)."""
+        if self._graph is None or self._split_edge is None:
+            raise RuntimeError(
+                "No cached negatives available and no graph provided for on-the-fly computation. "
+                "Re-run precompute_subgraphs.py with --neg_epochs > 0."
+            )
+        from scripts.precompute_subgraphs import (
+            extract_subgraph,
+            sample_neg_edges,
+            build_adj_t,
+        )
+
+        print(f"  Computing negatives on-the-fly (slow) ...")
+        torch.manual_seed(seed + epoch * 1000)
+        pos_edges = self._split_edge[self.data_split]["edge"]
+
+        if "edge_neg" in self._split_edge[self.data_split]:
+            neg_edges = self._split_edge[self.data_split]["edge_neg"]
+        else:
+            neg_edges = sample_neg_edges(
+                pos_edges,
+                self._graph.edge_index,
+                self._graph.num_nodes,
+                self.neg_ratio,
+            )
+
+        depth, num_neighbors = self._sampling_config["edge_ego"]["depth_neighbors"][0]
+        replace = self._sampling_config["edge_ego"]["replace"]
+
+        if self._adj_t is None:
+            self._adj_t = build_adj_t(self._graph)
+
+        neg_data = []
+        for i in tqdm(range(len(neg_edges)), desc="neg on-the-fly"):
+            src, dst = neg_edges[i].tolist()
+            data = extract_subgraph(
+                self._adj_t, self._graph, int(src), int(dst), 0,
+                depth, num_neighbors, replace, len(self._pos_data) + i
+            )
+            neg_data.append(data)
+        return neg_data
+
+    def __len__(self):
+        return len(self._pos_data) + len(self._neg_data)
+
+    def __getitem__(self, idx):
+        assert isinstance(idx, int)
+        if idx < len(self._pos_data):
+            data = self._pos_data[idx]
+        else:
+            data = self._neg_data[idx - len(self._pos_data)]
+        return idx, data
+
+
+def build_adj_t(graph: Data) -> SparseTensor:
+    """Build SparseTensor adjacency (transposed) from edge_index."""
+    row, col = graph.edge_index.cpu()
+    return SparseTensor(
+        row=row, col=col,
+        value=torch.arange(col.size(0)),
+        sparse_sizes=(graph.num_nodes, graph.num_nodes),
+    ).t()
 
 
 @_map_dataset("edge_random")
