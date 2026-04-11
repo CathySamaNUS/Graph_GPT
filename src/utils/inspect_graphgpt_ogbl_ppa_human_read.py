@@ -4,7 +4,11 @@ from pprint import pformat
 import torch
 from omegaconf import OmegaConf
 
-from src.conf.base_configs import TrainingConfig
+from src.conf.base_configs import (
+    TrainingConfig,
+    PretrainMlmConfig,
+    PretrainMlmParams,
+)
 from src.conf.tokenization.token_configs import DataConfig
 from src.data.data_sources import read_dataset
 
@@ -44,6 +48,18 @@ def data_brief(data):
     return "\n".join(lines)
 
 
+def _default_pretrain_mlm():
+    return PretrainMlmConfig(
+        name="linear",
+        params=PretrainMlmParams(
+            fixed_ratio=0.0,
+            power=1,
+            mtp=[80, 0, 20],
+            umr_clip=[0.0, 1.0],
+        ),
+    )
+
+
 def main():
     args = parse_args()
 
@@ -65,7 +81,11 @@ def main():
         sampling=sampling,
         return_valid_test=True,
     )
-    train_cfg = TrainingConfig(pretrain_mode=False, task_type="edge")
+    train_cfg = TrainingConfig(
+        pretrain_mode=False,
+        task_type="edge",
+        pretrain_mlm=_default_pretrain_mlm(),
+    )
 
     print("Reading dataset with config:")
     print(

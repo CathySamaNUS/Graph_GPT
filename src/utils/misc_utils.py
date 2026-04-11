@@ -9,7 +9,10 @@ import base64
 import pandas as pd
 from typing import List, Optional
 from tqdm import tqdm
-import deepspeed
+try:
+    import deepspeed
+except Exception:
+    deepspeed = None
 import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset, DataLoader
@@ -103,12 +106,11 @@ def save_ckp(
 
 
 def save_ddp_ckp(output_dir, model, optimizer, lr_scheduler):
-    assert isinstance(model, DDP), f"model type: {type(model)}"
     # 1. save model params
     # https://pytorch.org/tutorials/intermediate/ddp_tutorial.html#save-and-load-checkpoints
     fn_model = os.path.join(output_dir, MODEL_NAME)
     torch.save(model.state_dict(), fn_model)
-    print(f"DDP Model saved in {fn_model} using torch API.")
+    print(f"Model saved in {fn_model} using torch API.")
     # 2. save optimizer stats
     if optimizer is not None:
         fn_optimizer = os.path.join(output_dir, OPTIMIZER_NAME)

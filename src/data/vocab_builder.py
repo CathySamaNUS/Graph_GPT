@@ -95,7 +95,10 @@ def get_semantics_vocab(dataset: Dataset, config: Dict):
             )
             new_ds = read_complete_mol_features_ds()
             # deepcopy to avoiding changing the content of dataset._data, otherwise causing error right after vocab building
-            data = dataset._data.clone()
+            if isinstance(dataset, list):
+                data = dataset[0].clone()
+            else:
+                data = dataset._data.clone()
             data.x = new_ds[0].x
             data.edge_attr = new_ds[0].edge_attr
             dataset = [data]

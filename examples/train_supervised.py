@@ -2,7 +2,10 @@ import os
 
 import dataclasses
 import multiprocessing as mp
-import deepspeed
+try:
+    import deepspeed
+except Exception:
+    deepspeed = None
 from datetime import datetime
 from pprint import pprint, pformat
 from torch.utils.data import IterableDataset
@@ -214,6 +217,7 @@ def train(cfg: Config):
             training=train_cfg,
             loss_utils=loss_utils,
         )
+        scheduler_conf = {}
     device = model.device
     print(f"optimizer: {opt_stats.optimizer}")
     print(f"[{datetime.now()}] Finish -> 3. set optimizer")
