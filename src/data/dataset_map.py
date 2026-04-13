@@ -855,20 +855,18 @@ class CachedShaDowKHopSeqFromEdgesMapDataset(torch.utils.data.Dataset):
         )
         self._neg_epochs_available = self.metadata.get("neg_epochs_computed", 0)
 
-        # Count positive samples
-        self._pos_count = 0
-        for cf in self._pos_chunks:
-            chunk = torch.load(cf, map_location="cpu", weights_only=False)
-            self._pos_count += len(chunk)
-            del chunk
-
-        # Preload all positive subgraphs into memory for fast access
-        print(f"[{datetime.now()}] Loading {self._pos_count} cached positive subgraphs for {data_split} ...")
-        self._pos_data = []
+        # Load positive subgraphs as chunks (not flattened) to avoid too-many-open-files
+        print(f"[{datetime.now()}] Loading cached positive subgraphs for {data_split} ...")
+        self._pos_chunks_data = []
+        self._pos_chunk_offsets = []  # (start_idx, end_idx) for each chunk
+        offset = 0
         for cf in tqdm(self._pos_chunks, desc=f"Loading {data_split}/pos"):
             chunk = torch.load(cf, map_location="cpu", weights_only=False)
-            self._pos_data.extend(chunk)
-            del chunk
+            self._pos_chunks_data.append(chunk)
+            self._pos_chunk_offsets.append((offset, offset + len(chunk)))
+            offset += len(chunk)
+        self._pos_count = offset
+        print(f"  Loaded {self._pos_count} positive subgraphs in {len(self._pos_chunks_data)} chunks")
 
         # For on-the-fly negative fallback
         self._graph = graph
@@ -885,6 +883,13 @@ class CachedShaDowKHopSeqFromEdgesMapDataset(torch.utils.data.Dataset):
         self.all_edges_with_y = None
         self.sampler = None
         self.reset_samples()
+
+    def _get_pos(self, idx: int):
+        """Get a positive subgraph by global index using chunked storage."""
+        for chunk_data, (start, end) in zip(self._pos_chunks_data, self._pos_chunk_offsets):
+            if start <= idx < end:
+                return chunk_data[idx - start]
+        raise IndexError(f"Positive index {idx} out of range [0, {self._pos_count})")
 
     def _load_neg_epoch(self, epoch: int):
         """Load pre-computed negative subgraphs for a given epoch."""
@@ -932,28 +937,35 @@ class CachedShaDowKHopSeqFromEdgesMapDataset(torch.utils.data.Dataset):
         else:
             self._neg_data = self._compute_neg_on_the_fly(epoch, seed)
 
-        total = len(self._pos_data) + len(self._neg_data)
+        total = self._pos_count + len(self._neg_data)
 
         # Build all_edges_with_y for compatibility
-        pos_ey = torch.stack(
-            [torch.tensor([d.seed_node[0].item(), d.seed_node[1].item(), d.y.item()]) for d in self._pos_data]
-        )
+        pos_ey_list = []
+        for chunk_data in self._pos_chunks_data:
+            for d in chunk_data:
+                pos_ey_list.append(torch.tensor([d.seed_node[0].item(), d.seed_node[1].item(), d.y.item()]))
+        pos_ey = torch.stack(pos_ey_list)
+        del pos_ey_list
         neg_ey = torch.stack(
             [torch.tensor([d.seed_node[0].item(), d.seed_node[1].item(), d.y.item()]) for d in self._neg_data]
         )
         self.all_edges_with_y = torch.cat([pos_ey, neg_ey], dim=0)
 
-        # Re-index all data
-        for i, d in enumerate(self._pos_data):
-            d.idx = i
+        # Re-index all data (positives)
+        global_idx = 0
+        for chunk_data in self._pos_chunks_data:
+            for d in chunk_data:
+                d.idx = global_idx
+                global_idx += 1
+        # Re-index negatives
         for i, d in enumerate(self._neg_data):
-            d.idx = len(self._pos_data) + i
+            d.idx = self._pos_count + i
 
         self.sampler = list(range(total))
         random.shuffle(self.sampler)
         print(
             f"[{datetime.now()}] FINISH reset cached dataset: "
-            f"{len(self._pos_data)} pos + {len(self._neg_data)} neg = {total} total\n"
+            f"{self._pos_count} pos + {len(self._neg_data)} neg = {total} total\n"
         )
 
     def _compute_neg_on_the_fly(self, epoch, seed):
@@ -1000,14 +1012,14 @@ class CachedShaDowKHopSeqFromEdgesMapDataset(torch.utils.data.Dataset):
         return neg_data
 
     def __len__(self):
-        return len(self._pos_data) + len(self._neg_data)
+        return self._pos_count + len(self._neg_data)
 
     def __getitem__(self, idx):
         assert isinstance(idx, int)
-        if idx < len(self._pos_data):
-            data = self._pos_data[idx]
+        if idx < self._pos_count:
+            data = self._get_pos(idx)
         else:
-            data = self._neg_data[idx - len(self._pos_data)]
+            data = self._neg_data[idx - self._pos_count]
         return idx, data
 
 

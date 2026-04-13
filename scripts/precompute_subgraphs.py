@@ -79,12 +79,14 @@ def load_graph_and_splits(data_dir: str, data_path: str):
     )
     # Add node IDs and transform x (same as data_sources.py)
     graph.id = torch.arange(graph.num_nodes)
-    # _get_global_local_id_from_onehot equivalent
+    # Must match _get_global_local_id_from_onehot in data_sources.py exactly
     if graph.x is not None and graph.x.dim() == 2:
-        x_gid = graph.x.argmax(dim=-1)
-        graph.x_gid = x_gid
-        local_id = torch.arange(graph.num_nodes)
-        graph.x = torch.stack([x_gid, local_id], dim=-1)
+        x_gid = torch.argmax(graph.x, dim=-1, keepdim=True) + 1  # +1 matches data_sources.py
+        graph.x_gid = x_gid.squeeze(-1)
+        x_cum = torch.cumsum(graph.x, dim=0)
+        idx = x_cum * graph.x
+        local_id = idx.sum(dim=-1).view((-1, 1))
+        graph.x = torch.cat([x_gid, local_id], dim=1)  # [N, 2]
     return graph, split_edge, dataset_root
 
 

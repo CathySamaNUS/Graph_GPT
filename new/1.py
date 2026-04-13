@@ -140,7 +140,7 @@ def choose_uniprot_accessions(
 
 
 def fetch_uniprot_fasta(
-    accessions: list[str], batch_size: int = 200
+    accessions: list[str], batch_size: int = 50
 ) -> dict[str, str]:
     """
     Use UniProtKB search to fetch FASTA in batches.
@@ -152,13 +152,23 @@ def fetch_uniprot_fasta(
     for i in tqdm(range(0, len(accessions), batch_size), desc="Fetch UniProt FASTA"):
         batch = accessions[i : i + batch_size]
         q = " OR ".join([f"accession:{a}" for a in batch])
-        r = session.get(
-            f"{UNIPROT_REST}/uniprotkb/search",
-            params={"query": q, "format": "fasta"},
-            timeout=120,
-        )
-        r.raise_for_status()
-        fasta = r.text.strip()
+        fasta = None
+        for attempt in range(3):
+            try:
+                r = session.get(
+                    f"{UNIPROT_REST}/uniprotkb/search",
+                    params={"query": q, "format": "fasta"},
+                    timeout=120,
+                )
+                r.raise_for_status()
+                fasta = r.text.strip()
+                break
+            except Exception as e:
+                print(f"\n  Batch {i//batch_size} attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    print(f"  Skipping batch {i//batch_size} after 3 failures")
         if not fasta:
             continue
 
@@ -217,7 +227,20 @@ def esm2_embed(
     model = model.to(device).eval()
     batch_converter = alphabet.get_batch_converter()
 
-    items = list(seqs.items())
+    # Truncate long sequences to ESM-2 max context (1022 tokens = 1024 - BOS - EOS)
+    max_seq_len = 1022
+    truncated = 0
+    items = []
+    for key, seq in seqs.items():
+        if len(seq) > max_seq_len:
+            seq = seq[:max_seq_len]
+            truncated += 1
+        items.append((key, seq))
+    if truncated:
+        print(f"  Truncated {truncated} sequences to {max_seq_len} residues")
+
+    # Sort by length (shortest first) to minimize padding waste
+    items.sort(key=lambda x: len(x[1]))
     out = {}
 
     for i in tqdm(range(0, len(items), batch_size), desc="ESM2 embed"):
@@ -226,12 +249,26 @@ def esm2_embed(
         del labels, strs
         tokens = tokens.to(device)
 
-        res = model(tokens, repr_layers=[layer], return_contacts=False)
-        token_reps = res["representations"][layer]
-        pooled = pool_embeddings(token_reps, tokens, alphabet, mode=pooling)
-
-        for b, (key, _) in enumerate(batch_items):
-            out[key] = pooled[b].detach().cpu()
+        try:
+            res = model(tokens, repr_layers=[layer], return_contacts=False)
+            token_reps = res["representations"][layer]
+            pooled = pool_embeddings(token_reps, tokens, alphabet, mode=pooling)
+            for b, (key, _) in enumerate(batch_items):
+                out[key] = pooled[b].detach().cpu()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            # Retry one-by-one
+            print(f"\n  OOM at batch {i//batch_size}, retrying one-by-one...")
+            for key, seq in batch_items:
+                try:
+                    _, _, tok = batch_converter([(key, seq)])
+                    tok = tok.to(device)
+                    r = model(tok, repr_layers=[layer], return_contacts=False)
+                    p = pool_embeddings(r["representations"][layer], tok, alphabet, mode=pooling)
+                    out[key] = p[0].detach().cpu()
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    print(f"  Skipping {key} (len={len(seq)}): OOM even with batch_size=1")
     return out
 
 
