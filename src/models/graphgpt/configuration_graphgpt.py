@@ -53,6 +53,7 @@ class GraphGPTConfig(LlamaConfig):
         pos_bins: int = 512,  # for mol's 3D positions
         # For input with embed features
         embed_dim: int = 0,
+        fusion_method: str = "additive",  # additive|gated|concat|late
         # For pre-train task
         next_n_token: int = 1,
         focal_gamma: float = 0,  # param for focal-loss
@@ -83,6 +84,7 @@ class GraphGPTConfig(LlamaConfig):
         self.pos_agg_method = pos_agg_method
         self.pos_bins = pos_bins
         self.embed_dim = embed_dim
+        self.fusion_method = fusion_method
         # 2. For downstream tasks
         self.cls_token_id = cls_token_id
         self.mlp = [] if mlp is None else list(mlp)
@@ -170,6 +172,7 @@ def convert_to_legacy_config(model_config: GraphGPTModelConfig) -> GraphGPTConfi
         "stack_method": model_config.graph_input.stack_method,
         "stacked_feat_agg_method": model_config.graph_input.stacked_feat_agg_method,
         "embed_dim": model_config.graph_input.embed_dim,
+        "fusion_method": model_config.graph_input.fusion_method,
         # Parameters from `geometric_input`
         "pos_agg_method": model_config.geometric_input.pos_agg_method,
         "pos_bins": model_config.geometric_input.pos_bins,

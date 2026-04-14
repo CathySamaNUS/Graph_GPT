@@ -523,14 +523,19 @@ def set_dist_env(train_cfg: TrainingConfig):
 
     # 2. init distributed train
     try:
+        # Set default env vars for single-GPU if not in distributed launch
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
         dist.init_process_group(
             backend="nccl", init_method="env://", timeout=timedelta(seconds=1800)
         )
         dist.barrier()
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-    except ValueError:
-        print("In local test setting!!!\n" * 5)
+    except (ValueError, RuntimeError, KeyError) as e:
+        print(f"In local test setting!!! ({e})\n" * 5)
         train_cfg.schedule.logging_steps = 5
         world_size = 1
         rank = 0

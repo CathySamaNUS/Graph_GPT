@@ -61,6 +61,7 @@ model:
     stack_method: "short"  # short|long|prolonged
     stacked_feat_agg_method: "sum"
     embed_dim: 0  # Total dimension of external embeddings if provided as input: node.embed_dim + edge.embed_dim
+    fusion_method: "additive"  # additive|gated|concat|late
 
   # --- geometric-Specific Input Settings ---
   geometric_input:

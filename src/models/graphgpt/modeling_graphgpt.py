@@ -851,6 +851,7 @@ class GraphGPTTaskModel(LlamaPreTrainedModel):
         if config.stack_method in {"short", "long"}:
             self.stacked_feat_agg = StackedFeatAggregation(config)
         # 1.3 inputs got raw embed feature
+        self.fusion_method = getattr(config, 'fusion_method', 'additive')
         if config.embed_dim > 0:
             self.raw_embed_dropout = None
             if config.embed_pdrop > 0:
@@ -858,15 +859,41 @@ class GraphGPTTaskModel(LlamaPreTrainedModel):
             self.embed_layernorm = modeling_llama.LlamaRMSNorm(
                 config.embed_dim, eps=config.rms_norm_eps
             )
-            self.embed_proj = nn.Linear(
-                config.embed_dim, config.hidden_size, bias=False
-            )  # set bias=True to serve as the default when `embed==0`
+            if self.fusion_method == 'concat':
+                # Concat: project embed to hidden_size, then concat → 2*hidden_size
+                self.embed_proj = nn.Linear(
+                    config.embed_dim, config.hidden_size, bias=False
+                )
+                # Project concatenated 2*hidden_size back to hidden_size
+                self.concat_proj = nn.Linear(
+                    config.hidden_size * 2, config.hidden_size, bias=False
+                )
+            elif self.fusion_method == 'gated':
+                # Gated: learn per-node gate to control ESM-2 contribution
+                self.embed_proj = nn.Linear(
+                    config.embed_dim, config.hidden_size, bias=False
+                )
+                self.gate_proj = nn.Linear(
+                    config.embed_dim, config.hidden_size, bias=True
+                )
+            elif self.fusion_method == 'late':
+                # Late: project embed at classification head, not input
+                self.embed_proj_late = nn.Linear(
+                    config.embed_dim, config.hidden_size, bias=False
+                )
+            else:
+                # Additive (default)
+                self.embed_proj = nn.Linear(
+                    config.embed_dim, config.hidden_size, bias=False
+                )
+        print(f"Fusion method: {self.fusion_method}")
         # 2. Init for SequenceClassification, refer to `LlamaForSequenceClassification`
         bias = self.config.problem_type == "regression"
         self.num_labels = config.num_labels
+        score_input_dim = config.hidden_size * 2 if (self.fusion_method == 'late' and config.embed_dim > 0) else config.hidden_size
         if len(self.config.mlp) > 0:
             self.score = MLP(
-                config.hidden_size,
+                score_input_dim,
                 self.num_labels,
                 mlp=self.config.mlp,
                 hidden_act=self.config.hidden_act,
@@ -874,7 +901,7 @@ class GraphGPTTaskModel(LlamaPreTrainedModel):
                 bias=bias,
             )
         else:
-            self.score = nn.Linear(config.hidden_size, self.num_labels, bias=bias)
+            self.score = nn.Linear(score_input_dim, self.num_labels, bias=bias)
         self.pos_weight = None
 
         self.pooling_method = config.pooling_method  # "last|sum|mean"
@@ -910,11 +937,30 @@ class GraphGPTTaskModel(LlamaPreTrainedModel):
             self, input_ids, inputs_embeds
         )
 
-        inputs_raw_embeds = transform_inputs_raw_embeds(
-            self, inputs_raw_embeds, inputs_embeds.dtype
-        )
-        if inputs_raw_embeds is not None:
-            inputs_embeds = inputs_embeds + inputs_raw_embeds
+        if self.fusion_method == 'late':
+            # Late fusion: store raw embeds for later, don't fuse at input
+            self._raw_embeds_for_late_fusion = inputs_raw_embeds
+            return input_ids, inputs_embeds, in_
+
+        # For additive/gated/concat: transform raw embeds first (layernorm + dropout)
+        if self.config.embed_dim > 0 and inputs_raw_embeds is not None:
+            inputs_raw_embeds = inputs_raw_embeds.to(inputs_embeds.dtype)
+            inputs_raw_embeds = self.embed_layernorm(inputs_raw_embeds)
+            if self.raw_embed_dropout is not None:
+                inputs_raw_embeds = self.raw_embed_dropout(inputs_raw_embeds)
+
+            if self.fusion_method == 'gated':
+                gate = torch.sigmoid(self.gate_proj(inputs_raw_embeds))
+                projected = self.embed_proj(inputs_raw_embeds)
+                inputs_embeds = inputs_embeds + gate * projected
+            elif self.fusion_method == 'concat':
+                projected = self.embed_proj(inputs_raw_embeds)
+                inputs_embeds = self.concat_proj(torch.cat([inputs_embeds, projected], dim=-1))
+            else:
+                # Additive (default)
+                projected = self.embed_proj(inputs_raw_embeds)
+                inputs_embeds = inputs_embeds + projected
+
         return input_ids, inputs_embeds, in_
 
     def get_logits_for_token_lvl_task(
@@ -1070,8 +1116,26 @@ class GraphGPTTaskModel(LlamaPreTrainedModel):
         )
         hidden_states = outputs[0]  # [N, seq, dim]
 
+        # Late fusion: concatenate projected ESM-2 embeddings at the pooled hidden state level
+        if self.fusion_method == 'late' and self.config.embed_dim > 0 and hasattr(self, '_raw_embeds_for_late_fusion'):
+            raw_embeds = self._raw_embeds_for_late_fusion
+            if raw_embeds is not None:
+                raw_embeds = raw_embeds.to(hidden_states.dtype)
+                raw_embeds = self.embed_layernorm(raw_embeds)
+                if self.raw_embed_dropout is not None:
+                    raw_embeds = self.raw_embed_dropout(raw_embeds)
+                late_proj = self.embed_proj_late(raw_embeds)  # [N, seq, hidden_size]
+                # Concatenate along feature dim for late fusion
+                hidden_states_for_score = torch.cat([hidden_states, late_proj], dim=-1)  # [N, seq, 2*hidden_size]
+            else:
+                # No raw embeds, pad with zeros
+                hidden_states_for_score = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=-1)
+            del self._raw_embeds_for_late_fusion
+        else:
+            hidden_states_for_score = hidden_states
+
         # 1.1 Calculate logits for task, refer to `LlamaForSequenceClassification`
-        logits = self.score(hidden_states)  # [N, seq, num_labels]
+        logits = self.score(hidden_states_for_score)  # [N, seq, num_labels]
 
         batch_size = _get_batch_size(input_ids, inputs_embeds)
         assert self.config.pad_token_id is not None
