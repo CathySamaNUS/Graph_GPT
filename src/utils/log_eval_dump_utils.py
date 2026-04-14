@@ -136,7 +136,7 @@ def ft_evaluate(model, loader, cfg: Config, eval_name: str):
     ogb_input_dict = cls_metrics.to_dict()
     try:
         world_size = dist.get_world_size()
-    except ValueError:
+    except (ValueError, RuntimeError):
         print("In local test setting!!!\n" * 5)
         world_size = 1
     if world_size > 1:

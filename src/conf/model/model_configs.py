@@ -42,6 +42,8 @@ class GraphInputConfig:
     stacked_feat_agg_method: str = "sum"
     # Dimension of external embeddings if provided as input of node or edge.
     embed_dim: int = 0
+    # Fusion method for combining token embeddings with raw embeddings
+    fusion_method: str = "additive"  # additive|gated|concat|late
 
 
 @dataclass

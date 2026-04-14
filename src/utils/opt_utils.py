@@ -11,7 +11,7 @@ def initialize_optimizer(model, model_parameters, training: TrainingConfig, loss
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         model = DDP(model.to(device), find_unused_parameters=False)
-    except ValueError:
+    except (ValueError, RuntimeError):
         print("In local test setting!!!\n" * 5)
     # if optimizer is None:
     #     cus_opt = StableAdamW if use_stable else torch.optim.AdamW

@@ -1,0 +1,132 @@
+#!/bin/bash
+#PBS -N esm2_graphgpt
+#PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -q normal
+#PBS -j oe
+#PBS -o /home/users/nus/e1553200/Graph_GPT/esm2_experiment.log
+
+cd /home/users/nus/e1553200/Graph_GPT
+module load miniforge3/25.3.1
+source activate /home/users/nus/e1553200/graphgpt_env
+
+WHEELS=/home/users/nus/e1553200/wheels
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONUNBUFFERED=1
+LIVE_LOG=/home/users/nus/e1553200/Graph_GPT/esm2_experiment_live.log
+> $LIVE_LOG
+
+echo "========================================"
+echo "Step 1: Fix environment"
+echo "========================================"
+
+# Revert to torch 2.1.2 + reinstall torch-sparse/scatter from local wheels
+pip install --no-index --find-links $WHEELS torch==2.1.2+cu118 torchvision==0.16.2+cu118 --no-deps --force-reinstall
+pip install --no-index --find-links $WHEELS torch-sparse torch-scatter --force-reinstall --no-deps
+pip install 'numpy<2' --no-deps
+pip install --no-index --find-links $WHEELS fair-esm --no-deps
+
+python -c "
+import torch; print(f'torch {torch.__version__}, CUDA: {torch.cuda.is_available()}')
+import torch_sparse; print('torch_sparse OK')
+from src.models import GraphGPTTaskModel; print('model OK')
+print('ALL OK')
+" || { echo "IMPORT FAILED"; exit 1; }
+
+echo "========================================"
+echo "Step 2: Generate ESM-2 embeddings"
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
+echo "========================================"
+
+if [ -f data/OGB/ogbl_ppa_human/node_x_embed.pt ] && [ -f data/OGB/ogbl_ppa_human/node_has_esm.pt ]; then
+    echo "ESM-2 embeddings already exist, skipping"
+else
+    python scripts/embed_sequences.py \
+        --data_dir data/OGB/ogbl_ppa_human \
+        --model_name esm2_t33_650M_UR50D \
+        --layer 33 \
+        --batch_size 2 \
+        --pca_dim 256
+
+    if [ $? -ne 0 ]; then
+        echo "ESM-2 EMBEDDING FAILED"; exit 1
+    fi
+fi
+
+echo "========================================"
+echo "Step 3: Experiment 3 - ESM2 + GraphGPT Combined"
+echo "========================================"
+
+HIDDEN=128
+LAYERS=2
+EPOCHS=6
+BATCH_SIZE=128
+NUM_WORKERS=4
+LR=3e-4
+WARMUP_EPOCHS=0.6
+EMBED_DIM=256
+OUTPUT_DIR="./exp/models/ogbl_ppa_human/esm2combined_pca256_h${HIDDEN}_l${LAYERS}_b${BATCH_SIZE}_e${EPOCHS}_lr${LR}"
+
+rm -rf ${OUTPUT_DIR}
+
+echo "Model: h=${HIDDEN} l=${LAYERS} (~200K params)"
+echo "ESM-2: PCA 1280->256"
+echo "Batch: ${BATCH_SIZE}, Workers: ${NUM_WORKERS}"
+echo "Output: ${OUTPUT_DIR}"
+
+python ./examples/train_supervised.py \
+  tokenization.data.data_dir=./data/OGB \
+  tokenization.data.data_path=ogbl_ppa_human \
+  tokenization.data.dataset=ogbl-ppa-human \
+  tokenization.data.return_valid_test=true \
+  tokenization.tokenizer_class=StackedGSTTokenizer \
+  'tokenization.data.sampling={edge_ego:{depth_neighbors:[[1,14]],neg_ratio:1,replace:false,method:{name:global},percent:100}}' \
+  tokenization.attr_world_identifier=protein \
+  tokenization.semantics.node.dim=2 \
+  tokenization.semantics.node.embed=x_embed \
+  tokenization.semantics.node.embed_dim=${EMBED_DIM} \
+  'tokenization.semantics.edge.discrete=null' \
+  tokenization.semantics.edge.dim=0 \
+  training.output_dir=${OUTPUT_DIR} \
+  'training.pretrain_cpt=' \
+  training.task_type=edge \
+  training.batch_size=${BATCH_SIZE} \
+  training.batch_size_eval=${BATCH_SIZE} \
+  training.num_workers=${NUM_WORKERS} \
+  training.schedule.epochs=${EPOCHS} \
+  training.schedule.warmup_epochs=${WARMUP_EPOCHS} \
+  training.optimizer.lr=${LR} \
+  training.optimizer.min_lr=0 \
+  training.optimizer.eps=1e-10 \
+  'training.optimizer.betas=[0.9,0.99]' \
+  training.optimizer.weight_decay=0 \
+  training.optimizer.max_grad_norm=1 \
+  training.optimizer.use_ema=false \
+  training.ft_eval.k_samplers=512 \
+  training.ft_eval.epoch_per_eval=1 \
+  training.ft_eval.eval_only=false \
+  training.ft_eval.true_valid=-1 \
+  training.ft_eval.save_pred=false \
+  'training.deepspeed_conf_file=' \
+  model.hidden_size=${HIDDEN} \
+  model.num_hidden_layers=${LAYERS} \
+  model.num_attention_heads=0 \
+  model.intermediate_size=0 \
+  model.hidden_act=gelu \
+  model.max_position_embeddings=1024 \
+  model.causal_attention=false \
+  model.layer_scale_init_value=0 \
+  model.graph_input.stack_method=short \
+  model.graph_input.stacked_feat_agg_method=gated \
+  model.graph_input.embed_dim=${EMBED_DIM} \
+  model.dropout_settings.attention_dropout=0.1 \
+  model.dropout_settings.path_dropout=0 \
+  model.dropout_settings.embed_dropout=0 \
+  model.dropout_settings.mlp_dropout=0 \
+  model.ft_head.problem_type=single_label_classification \
+  model.ft_head.num_labels=2 \
+  2>&1 | tee -a $LIVE_LOG
+
+echo "========================================"
+echo "Done: $(date)"
+echo "========================================"

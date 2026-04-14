@@ -40,7 +40,11 @@ from transformers.models.llama import modeling_llama
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.beit.modeling_beit import BeitDropPath
 from transformers.utils.import_utils import is_torch_fx_available
-from transformers.modeling_rope_utils import dynamic_rope_update
+try:
+    from transformers.modeling_rope_utils import dynamic_rope_update
+except ImportError:
+    def dynamic_rope_update(func):
+        return func
 from src.utils.attn_mask_utils import is_torch_greater_or_equal_than_1_13
 from src.utils.attn_mask_utils import (
     _prepare_4d_causal_bi_attention_mask,
